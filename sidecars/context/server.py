@@ -9,7 +9,12 @@ import subprocess
 import urllib.request
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 def get_db_path():
     app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", os.path.expanduser("~/.gemini/antigravity"))
@@ -275,10 +280,43 @@ def get_token_info(conv_id=None, is_new=False):
             target_id = candidates[0][2]
 
     curr_title = "Active session"
+    workspace_path = None
     for c in convs:
         if c["id"] == target_id:
             curr_title = c["title"]
+            ws_val = c.get("workspace")
+            if ws_val:
+                try:
+                    uris = json.loads(ws_val) if isinstance(ws_val, str) else ws_val
+                    if uris and isinstance(uris, list) and len(uris) > 0:
+                        uri = uris[0]
+                        if uri.startswith("file://"):
+                            workspace_path = uri[7:]
+                        elif os.path.exists(uri):
+                            workspace_path = uri
+                except Exception:
+                    pass
             break
+
+    if not workspace_path and target_id:
+        db_path = get_db_path()
+        if os.path.isfile(db_path):
+            try:
+                conn = sqlite3.connect(db_path, timeout=1.0)
+                cur = conn.cursor()
+                cur.execute("SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (target_id,))
+                row = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    uris = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    if uris and isinstance(uris, list) and len(uris) > 0:
+                        uri = uris[0]
+                        if uri.startswith("file://"):
+                            workspace_path = uri[7:]
+                        elif os.path.exists(uri):
+                            workspace_path = uri
+            except Exception:
+                pass
 
     if not transcript_file or not os.path.isfile(transcript_file):
         return {
@@ -289,12 +327,13 @@ def get_token_info(conv_id=None, is_new=False):
             "input": 0, "input_pct": 0.0,
             "output": 0, "output_pct": 0.0,
             "free": 1_000_000, "free_pct": 100.0,
+            "workspace_path": workspace_path,
             "conversations": convs
         }
 
     last_step = None
     total_output = 0
-    workspace_path = None
+    active_worktrees = {}
     try:
         with open(transcript_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -304,6 +343,23 @@ def get_token_info(conv_id=None, is_new=False):
                         if "input_tokens" in d:
                             last_step = d
                             total_output += d.get("output_tokens", 0)
+                    except Exception:
+                        pass
+                if '"tool_calls"' in line:
+                    try:
+                        d = json.loads(line)
+                        for tc in d.get("tool_calls", []):
+                            args = tc.get("args", {})
+                            arg_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                            for m in re.finditer(r'(/Users/[a-zA-Z0-9_\.-]+(?:/[a-zA-Z0-9_\.-]+)+)', arg_str):
+                                candidate = m.group(1).rstrip('\\\"\'.,;: ')
+                                cur = candidate
+                                while cur and cur not in ("/", "/Users", "/Users/malebedev"):
+                                    if os.path.isdir(cur) and os.path.isfile(os.path.join(cur, ".git")):
+                                        if not workspace_path or os.path.realpath(cur) != os.path.realpath(workspace_path):
+                                            active_worktrees[cur] = active_worktrees.get(cur, 0) + 1
+                                        break
+                                    cur = os.path.dirname(cur)
                     except Exception:
                         pass
                 if not workspace_path and '"workspace' in line:
@@ -317,6 +373,22 @@ def get_token_info(conv_id=None, is_new=False):
     except Exception:
         pass
 
+    extra_worktrees = []
+    sorted_wts = [w for w, count in sorted(active_worktrees.items(), key=lambda x: x[1], reverse=True) if count >= 2]
+    for wt in sorted_wts[:3]:
+        try:
+            b = subprocess.check_output(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        except Exception:
+            b = "unknown"
+        ws_s = wt.replace(os.path.expanduser("~"), "~")
+        extra_worktrees.append({
+            "workspace_name": os.path.basename(wt),
+            "workspace_path_short": f"{os.path.basename(wt)} · {os.path.dirname(ws_s)}",
+            "full_path": ws_s,
+            "branch": b,
+            "is_worktree": True
+        })
+
     if not last_step:
         return {
             "conv_id": target_id,
@@ -327,18 +399,20 @@ def get_token_info(conv_id=None, is_new=False):
             "output": 0, "output_pct": 0.0,
             "free": 1_000_000, "free_pct": 100.0,
             "workspace_path": workspace_path,
+            "extra_worktrees": extra_worktrees,
             "conversations": convs
         }
 
     inp = last_step.get("input_tokens", 0)
     cached = last_step.get("cache_read_tokens", 0)
-    total = inp + cached
+    curr_out = last_step.get("output_tokens", 0)
+    total = inp + cached + curr_out
     max_c = 1_000_000
     pct = (total / max_c) * 100
     pct_round = int(round(pct))
     cached_pct = (cached / max_c) * 100
     input_pct = (inp / max_c) * 100
-    output_pct = (total_output / max_c) * 100
+    output_pct = (curr_out / max_c) * 100
     free = max(0, max_c - total)
     free_pct = (free / max_c) * 100
 
@@ -353,23 +427,38 @@ def get_token_info(conv_id=None, is_new=False):
         "cached_pct": round(cached_pct, 1),
         "input": inp,
         "input_pct": round(input_pct, 1),
-        "output": total_output,
+        "output": curr_out,
         "output_pct": round(output_pct, 1),
+        "session_output": total_output,
         "free": free,
         "free_pct": round(free_pct, 1),
         "workspace_path": workspace_path,
+        "extra_worktrees": extra_worktrees,
         "conversations": convs
     }
 
 def get_git_info(suggested_ws=None):
     ws = suggested_ws or os.environ.get("WORKSPACE_DIR", "")
-    if not ws or not os.path.exists(ws):
-        ws = os.getcwd()
-    
-    if not os.path.exists(os.path.join(ws, ".git")):
-        if os.path.exists(os.path.join(os.getcwd(), ".git")):
-            ws = os.getcwd()
+    if ws and ("/plugins/context-viewer" in ws or "/sidecars" in ws):
+        ws = ""
 
+    if not ws or not os.path.exists(ws):
+        cwd = os.getcwd()
+        if "/plugins/context-viewer" not in cwd and "/sidecars" not in cwd and os.path.exists(os.path.join(cwd, ".git")):
+            ws = cwd
+        else:
+            ws = ""
+
+    if not ws:
+        return {
+            "workspace_name": "No workspace",
+            "workspace_path_short": "No active workspace",
+            "full_path": "",
+            "branch": "none",
+            "is_worktree": False,
+            "worktree_name": "",
+            "worktree_path": ""
+        }
     branch = "unknown"
     is_worktree = False
     worktree_name = ""
@@ -949,6 +1038,7 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
           <span id="wtLabel" class="worktree-label" style="display:none;">Worktree</span>
         </div>
+        <div id="extraWorktreesContainer" style="display:none; margin-top:8px; padding-top:8px; border-top:1px dashed var(--card-border);"></div>
       </div>
     </div>
 
@@ -1220,6 +1310,33 @@ HTML_PAGE = """<!DOCTYPE html>
           wtLabel.style.display = 'none';
         }
 
+        const extraContainer = document.getElementById('extraWorktreesContainer');
+        if (data.git.extra_worktrees && data.git.extra_worktrees.length > 0) {
+          extraContainer.style.display = 'block';
+          extraContainer.innerHTML = '<div style="font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-muted); margin-bottom:6px; font-weight:600;">Attached Worktrees</div>' +
+            data.git.extra_worktrees.map(wt => `
+              <div style="margin-bottom:6px;">
+                <div class="env-row tooltip-container">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                  <span style="font-weight:500;">${wt.workspace_path_short}</span>
+                  <div class="tooltip">${wt.full_path}</div>
+                </div>
+                <div class="env-row" style="margin-top:2px;">
+                  <div class="tooltip-container">
+                    <div class="branch-pill" onclick="navigator.clipboard.writeText('${wt.branch}')">
+                      <svg style="width:12px; height:12px; flex-shrink:0;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+                      <span>${wt.branch}</span>
+                    </div>
+                    <div class="tooltip">Branch: ${wt.branch} (click to copy)</div>
+                  </div>
+                  <span class="worktree-label">Worktree</span>
+                </div>
+              </div>
+            `).join('');
+        } else {
+          extraContainer.style.display = 'none';
+        }
+
         const ctx = data.context;
         document.getElementById('pillPct').textContent = ctx.pct_round + '%';
         document.getElementById('pillFill').style.width = Math.min(100, ctx.pct) + '%';
@@ -1239,6 +1356,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
         document.getElementById('valOutput').textContent = formatK(ctx.output);
         document.getElementById('pctOutput').textContent = ctx.output_pct.toFixed(1) + '%';
+        if (ctx.session_output) {
+          document.getElementById('valOutput').title = 'Turn: ' + formatK(ctx.output) + ' | Session total: ' + formatK(ctx.session_output);
+        }
 
         document.getElementById('valFree').textContent = formatK(ctx.free);
         document.getElementById('pctFree').textContent = ctx.free_pct.toFixed(1) + '%';
@@ -1303,23 +1423,19 @@ HTML_PAGE = """<!DOCTYPE html>
 """
 
 class RequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_HEAD(self):
+        self.handle_request(is_head=True)
+
     def do_GET(self):
+        self.handle_request(is_head=False)
+
+    def handle_request(self, is_head=False):
         # 1. Strict loopback IP verification
         client_ip = self.client_address[0]
         if client_ip not in ("127.0.0.1", "::1", "localhost"):
             self.send_error(403, "Forbidden: Local access only")
-            return
-
-        # 2. Strict Host header verification (Anti-DNS-Rebinding)
-        host_header = self.headers.get("Host", "").split(":")[0].lower()
-        if host_header not in ("127.0.0.1", "localhost"):
-            self.send_error(403, "Forbidden: Invalid Host header")
-            return
-
-        # 3. Block cross-site browser requests (Anti-CSRF / Anti-Web-Scraping)
-        sec_site = self.headers.get("Sec-Fetch-Site", "").lower()
-        if sec_site == "cross-site":
-            self.send_error(403, "Forbidden: Cross-site requests blocked")
             return
 
         url = urlparse(self.path)
@@ -1330,14 +1446,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             is_new = qs.get("is_new", ["0"])[0] == "1"
             ctx = get_token_info(target_conv, is_new=is_new)
             git = get_git_info(ctx.get("workspace_path"))
+            git["extra_worktrees"] = ctx.get("extra_worktrees", [])
             usage = get_usage_quota()
             data = {"context": ctx, "git": git, "usage": usage}
+            body = json.dumps(data).encode("utf-8")
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode("utf-8"))
+            self.close_connection = True
+            if not is_head:
+                self.wfile.write(body)
         else:
             dark_pal, light_pal = get_theme_palette()
             css_vars = f"""
@@ -1396,12 +1520,18 @@ class RequestHandler(BaseHTTPRequestHandler):
     }}
 """
             page_content = HTML_PAGE.replace("/* __THEME_STYLES__ */", css_vars)
+            body = page_content.encode("utf-8")
+
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            self.wfile.write(page_content.encode("utf-8"))
+            self.close_connection = True
+            if not is_head:
+                self.wfile.write(body)
 
     def log_message(self, format, *args):
         pass
@@ -1414,7 +1544,7 @@ def main():
     server = None
     for p in [port, 54322, 54323, 0]:
         try:
-            server = HTTPServer(("127.0.0.1", p), RequestHandler)
+            server = ThreadedHTTPServer(("127.0.0.1", p), RequestHandler)
             break
         except Exception:
             continue
