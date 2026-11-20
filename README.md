@@ -26,13 +26,12 @@ A lightweight, zero-token UI sidecar plugin for **Google Antigravity** that disp
   - Allows manual switching between past sessions via dropdown.
   - One-click `Set Auto` button to restore automatic active-session tracking.
   - Clean `0 tokens` state for `+ New Conversation` draft views.
-- **🎨 Native Gruvbox Material Theme**:
-  - Styled to seamlessly match Google Antigravity's Gruvbox Material preset (Dark `#282828` and Light `#fbf1c7`).
+- **🎨 Universal Adaptive & Transparent Theme**:
+  - Full background transparency with glassmorphic surfaces seamlessly adapts to any Antigravity theme preset (Gruvbox, Tokyo Night, Nord, Solarized, Catppuccin, Default Light & Dark).
   - Automatically adapts to system/IDE light & dark mode changes.
 - **🔒 Local Security Hardened**:
   - Binds strictly to `127.0.0.1` (loopback only, unreachable from external networks).
   - Enforces HTTP `Host` header validation to block DNS-rebinding attacks.
-  - Blocks cross-site browser requests (`Sec-Fetch-Site`).
 
 ---
 
