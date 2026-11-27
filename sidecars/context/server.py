@@ -152,28 +152,56 @@ def get_usage_quota():
     if now_ts - _usage_cache["time"] < 8 and _usage_cache["data"]:
         return _usage_cache["data"]
 
-    http_port = "60361"
-    try:
-        log_path = os.path.expanduser("~/Library/Logs/Antigravity/language_server.log")
-        if os.path.isfile(log_path):
-            with open(log_path, "r", encoding="utf-8") as f:
-                ports = re.findall(r"listening on random port at (\d+) for HTTP\b", f.read())
-                if ports:
-                    http_port = ports[-1]
-    except Exception:
-        pass
+    # 1. Primary source: Antigravity passes CSRF token & LS address directly in environment variables
+    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+    ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+    http_port = ls_addr.split(":")[-1] if ":" in ls_addr else None
 
-    csrf = None
-    try:
-        out = subprocess.check_output(["ps", "-A", "-o", "command"], stderr=subprocess.DEVNULL, text=True)
-        for line in out.splitlines():
-            if "language_server" in line and "--csrf_token" in line:
-                m = re.search(r"--csrf_token\s+([a-f0-9\-]+)", line)
-                if m:
-                    csrf = m.group(1)
-                    break
-    except Exception:
-        pass
+    # 2. Port fallback: tail of language_server.log
+    if not http_port:
+        try:
+            log_path = os.path.expanduser("~/Library/Logs/Antigravity/language_server.log")
+            if os.path.isfile(log_path):
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 65536))
+                    tail = f.read()
+                    ports = re.findall(r"listening on random port at (\d+) for HTTP\b", tail)
+                    if ports:
+                        http_port = ports[-1]
+        except Exception:
+            pass
+
+    if not http_port:
+        http_port = "65007"
+
+    # 3. CSRF fallbacks for external or detached runner
+    if not csrf:
+        try:
+            out = subprocess.check_output(["ps", "-A", "-o", "command"], stderr=subprocess.DEVNULL, text=True)
+            for line in out.splitlines():
+                if "language_server" in line and "--csrf_token" in line:
+                    m = re.search(r"--csrf_token\s+([a-f0-9\-]+)", line)
+                    if m:
+                        csrf = m.group(1)
+                        break
+        except Exception:
+            pass
+
+    if not csrf:
+        try:
+            out = subprocess.check_output(["ps", "-A", "-o", "pid,command"], stderr=subprocess.DEVNULL, text=True)
+            for line in out.splitlines():
+                if "server.py" in line:
+                    pid = line.split()[0]
+                    env_out = subprocess.check_output(["ps", "eww", pid], stderr=subprocess.DEVNULL, text=True)
+                    m = re.search(r"ANTIGRAVITY_CSRF_TOKEN=([a-f0-9\-]+)", env_out)
+                    if m:
+                        csrf = m.group(1)
+                        break
+        except Exception:
+            pass
 
     if not csrf:
         return _usage_cache["data"]
